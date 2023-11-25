@@ -231,13 +231,23 @@ impl net::DeviceOperations for E1000Driver {
             *dev_e1k = Some(e1000_device);
         }
 
+        // unchecked.
+        unsafe {
+            bindings::exe3_log();
+        }
 
         // Exercise3 Checkpoint 5
         // Enable interrupts
         // step1 set up irq_data
+        let irq_data = Box::try_new(IrqData {
+            dev_e1000: data.dev_e1000.clone(),
+            res: data.res.clone(),
+            napi: data.napi.clone(),
+        })?;
         // step2 request_irq
+        let registration = request_irq(data.irq, irq_data)?;
         // step3 set up irq_handler
-
+        data.irq_handler.store(&mut registration, Ordering::Relaxed);
 
         // Enable NAPI scheduling
         data.napi.enable();
