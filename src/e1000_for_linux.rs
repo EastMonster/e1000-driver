@@ -78,7 +78,43 @@ struct E1000Driver;
 impl E1000Driver {
     fn handle_rx_irq(dev: &net::Device, napi: &Napi, data: &NetData) {  
         // Exercise4 Checkpoint 1
-    }
+        // 收包中断处理 --- ref: 11/16 回放
+        let mut packets = 0;
+        let mut bytes = 0;
+
+        let recv_vec /* Option<Vec<Vec<u8>>> */ = {
+            let mut dev_e1k = data.dev_e1000.lock_irqdisable();
+            dev_e1k.as_mut().unwrap().e1000_recv() // 读取收到的包 (e1000.rs)
+        };
+
+        if let Some(vec) = recv_vec {
+            packets = vec.len(); 
+            
+            for packet in vec.iter() {
+                let len = packet.len();
+                let skb = dev.alloc_skb_ip_align(RXBUFFER).unwrap(); // net.rs: 136
+                let skb_buf = unsafe {
+                    from_raw_parts_mut(skb.head_data().as_ptr() as *mut u8, len)
+                };
+                skb_buf.copy_from_slice(&packet); // 分配一块缓冲区, 然后把包内数据复制进去
+
+                skb.put(len as u32);
+                let protocol = skb.eth_type_trans(dev);
+                skb.protocol_set(protocol);
+
+                napi.gro_receive(&skb); // 向上传递数据包
+
+                bytes += len;
+            }
+            pr_info!("handle_rx_irq: received packets: {}, bytes: {}\n", packets, bytes);
+        } else {
+            pr_warn!("handle_rx_irq: no packets were received.\n");
+        }
+
+        // 修改状态, 告知系统收到多少包
+        data.stats.rx_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        data.stats.rx_packets.fetch_add(packets as u64, Ordering::Relaxed);
+    } 
 
     fn handle_tx_irq() {
         // check status E1000_TXD_STAT_DD
@@ -232,9 +268,10 @@ impl net::DeviceOperations for E1000Driver {
         }
 
         // unchecked.
-        unsafe {
-            bindings::exe3_log();
-        }
+        // can't work.
+        // unsafe {
+        //     bindings::exe3_log();
+        // }
 
         // Exercise3 Checkpoint 5
         // Enable interrupts
@@ -247,7 +284,8 @@ impl net::DeviceOperations for E1000Driver {
         // step2 request_irq
         let registration = request_irq(data.irq, irq_data)?;
         // step3 set up irq_handler
-        data.irq_handler.store(&mut registration, Ordering::Relaxed);
+        data.irq_handler
+            .store(Box::into_raw(Box::try_new(registration)?), Ordering::Relaxed);
 
         // Enable NAPI scheduling
         data.napi.enable();
@@ -286,6 +324,43 @@ impl net::DeviceOperations for E1000Driver {
     ) -> NetdevTx {
         pr_info!("start xmit\n");
         // Exercise4 Checkpoint 2
+
+        skb.put_padto(bindings::ETH_ZLEN); // 应该是在设置包的长度?
+        let size = skb.len() - skb.data_len();
+        let skb_data = skb.head_data();
+
+        pr_info!(
+            "SkBuff length: {}, head data len: {}, get size: {}\n",
+            skb.len(),
+            skb_data.len(),
+            size,
+        );
+
+        dev.sent_queue(skb.len());
+
+        let len = {
+            let mut dev_e1k = data.dev_e1000.lock_irqdisable(); // 发包的时候临时关一下锁
+            dev_e1k.as_mut().unwrap().e1000_transmit(skb_data) // 发包
+        };
+
+        if len < 0 {
+            pr_warn!("Failed to send transmit the skbuff packet: {}\n", len);
+            return net::NetdevTx::Busy;
+        }
+
+        {
+            let bytes = skb.len() as u64;
+            let packets = 1;
+
+            skb.napi_consume(64); /* 更新 napi_gro_count 字段 (?) */
+
+            data.stats.tx_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+            data.stats.tx_packets.fetch_add(packets as u64, Ordering::Relaxed);
+
+            dev.completed_queue(packets as u32, bytes as u32);
+        }
+
+        net::NetdevTx::Ok
     }
 
     /// Corresponds to `ndo_get_stats64` in `struct net_device_ops`.
